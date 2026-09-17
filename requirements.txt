@@ -1,0 +1,4 @@
+mcp>=1.10.0,<2.0.0   # official MCP Python SDK (1.x line: mcp.server.fastmcp.FastMCP)
+requests>=2.31.0
+# The 'mcp' package pulls in starlette, pydantic, httpx, anyio, sse-starlette automatically.
+# Python 3.10+ required (Vercel's default runtime is fine).
