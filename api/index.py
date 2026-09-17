@@ -242,7 +242,7 @@ def send_message(session: requests.Session, chat_id: str, mode: str,
             params={"chat_id": chat_id},
             headers={"Accept": "*/*,text/event-stream", "Cache-Control": "no-store",
                      "Content-Type": "application/json; charset=UTF-8", "app_waf": APP_WAF},
-            json=payload, stream=True, timeout=180,
+            json=payload, stream=True, timeout=280,
         ) as r:
             if r.status_code != 200:
                 logger.warning("Qwen completions returned HTTP %s", r.status_code)
