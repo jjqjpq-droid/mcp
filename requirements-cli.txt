@@ -1,0 +1,8 @@
+# Requirements for mcp_cli.py — the standalone Qwen MCP CLI client.
+# (Kept separate from any server-side requirements.txt in this repo.)
+#
+# mcp>=1.9 is required for the stable streamable_http_client + ClientSession
+# API used by mcp_cli.py. Pinned to a known-good minor range so the client
+# code (which targets this SDK's current stable API) keeps working.
+mcp>=1.9.0,<2.0.0
+httpx>=0.27,<1.0
