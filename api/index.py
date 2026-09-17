@@ -33,6 +33,7 @@ from typing import Any
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
@@ -354,7 +355,34 @@ def qwen_chat_impl(message: str | None = None,
 # MCP server - Streamable HTTP, STATELESS (required for Vercel serverless)
 # ----------------------------------------------------------------------------
 
-mcp = FastMCP("qwen-chat", stateless_http=True)
+# Deployed behind a real hostname (Vercel), so the SDK's localhost-only
+# DNS-rebinding default would reject every request with a 421. Allowlist
+# the actual production/preview hosts instead of disabling the protection.
+# NOTE: transport_security is a FastMCP constructor argument in this SDK
+# version, not a streamable_http_app() kwarg. This SDK's Host/Origin check
+# only supports exact matches or a "host:*" port-wildcard suffix — it does
+# NOT support "*.example.com" subdomain wildcards — so every concrete host
+# this app can be reached on must be listed explicitly.
+_ALLOWED_HOSTS = [
+    "mcp-swart-pi.vercel.app",
+    "localhost",
+    "localhost:*",
+    "127.0.0.1",
+    "127.0.0.1:*",
+]
+# Every Vercel deployment also gets a unique per-deployment hostname
+# (mcp-<hash>-<team>.vercel.app); allow it via the VERCEL_URL env var that
+# Vercel injects at runtime for the current deployment.
+if os.environ.get("VERCEL_URL"):
+    _ALLOWED_HOSTS.append(os.environ["VERCEL_URL"])
+
+_transport_security = TransportSecuritySettings(
+    allowed_hosts=_ALLOWED_HOSTS,
+    allowed_origins=[f"https://{h}" for h in _ALLOWED_HOSTS if "*" not in h]
+    + ["http://localhost:*", "http://127.0.0.1:*"],
+)
+
+mcp = FastMCP("qwen-chat", stateless_http=True, transport_security=_transport_security)
 
 
 @mcp.tool(
@@ -417,10 +445,35 @@ async def healthz(request):
     })
 
 
-app = Starlette(
+inner_app = Starlette(
     routes=[
         Route("/healthz", healthz, methods=["GET"]),
         Mount("/", app=APIKeyAuthMiddleware(mcp_app)),
     ],
-    lifespan=mcp_app.lifespan,  # REQUIRED for streamable-http session manager
+    lifespan=mcp_app.router.lifespan_context,  # REQUIRED for streamable-http session manager
 )
+
+
+class StripRewritePrefixMiddleware:
+    """Vercel now rewrites requests to the literal destination path
+    ("/api/index/<original-path>") instead of preserving the original
+    request path in the ASGI scope. Strip that prefix back off so our
+    routes ("/", "/healthz", "/mcp") still match as expected.
+    """
+
+    PREFIX = "/api/index"
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path == self.PREFIX:
+                scope = {**scope, "path": "/"}
+            elif path.startswith(self.PREFIX + "/"):
+                scope = {**scope, "path": path[len(self.PREFIX):]}
+        await self.app(scope, receive, send)
+
+
+app = StripRewritePrefixMiddleware(inner_app)
