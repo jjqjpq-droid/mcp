@@ -7,17 +7,21 @@ Architecture:
     Claude Web -> Custom Connector -> this MCP server (Vercel)
         -> Qwen (chat.qwen.ai) -> response back to Claude Web
 
-Converted from auto.py:
-  * The interactive CLI loop (`while True: input(...)`) is REMOVED.
-  * The functionality is exposed as ONE MCP tool: `qwen_chat`.
-  * Credentials are hard-coded below (auto.py style). Vercel env vars
-    (QWEN_EMAIL etc.) are used ONLY as fallback when the code values are blank.
-  * No local `qwen_session.json`: the Qwen token is cached in warm-instance
-    memory with automatic re-login on JWT expiry; guest fallback preserved.
-
-Endpoints:
-    MCP:    POST https://<project>.vercel.app/mcp   (Streamable HTTP, stateless)
-    Health: GET  https://<project>.vercel.app/healthz
+Features:
+  * Automatic Re-login & Token Refresh:
+    - Dynamic handshake to fetch fresh edge cookies and tokens.
+    - Automatic detection of 401 / 403 / revoked JWT / expired session.
+    - On auth error, automatically invalidates dead tokens, performs fresh
+      login, stores the new token & cookies, and retries the request seamlessly.
+  * Robust Chat Session Management:
+    - Tries creating new chat; automatically falls back to reusing active
+      chats if WAF or server intercepts new chat creation.
+  * Direct Re-login Endpoints:
+    - GET / POST /relogin: Force an immediate fresh login and inspect token status.
+    - GET /healthz: Live health and auth status report.
+  * MCP Tools:
+    - `qwen_chat`: Send message(s) and get complete generated answer.
+    - `qwen_relogin`: Force re-login and token refresh directly from MCP.
 """
 
 from __future__ import annotations
@@ -58,32 +62,51 @@ APP_WAF = APP_WAF or os.environ.get("QWEN_APP_WAF", "").strip()
 BASE = "https://chat.qwen.ai"
 MODEL = os.environ.get("QWEN_MODEL", "qwen3.8-max").strip() or "qwen3.8-max"
 
-MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip()   # OPTIONAL - see README (Claude Web cannot send custom headers)
+MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip()   # OPTIONAL
 QWEN_TOKEN = os.environ.get("QWEN_TOKEN", "").strip()     # OPTIONAL pre-seeded Qwen JWT
+
+UA = ("Dalvik/2.1.0 (Linux; U; Android 16; V2502 Build/BP2A.250605.031.A3_V000L1) "
+      "AliApp(QWENCHAT/2.4.0) AppType/Release AplusBridgeLite")
 
 HEADERS = {
     "source": "app",
     "X-Platform": "android",
     "Accept-Language": "en-US",
     "Accept-Charset": "UTF-8",
-    "User-Agent": ("Dalvik/2.1.0 (Linux; U; Android 16; V2502 Build/BP2A.250605.031.A3_V000L1) "
-                   "AliApp(QWENCHAT/2.4.0) AppType/Release AplusBridgeLite"),
+    "User-Agent": UA,
 }
+if APP_WAF:
+    HEADERS["app_waf"] = APP_WAF
 
 MAX_MESSAGES = 50
 MAX_CONTENT_CHARS = 20000  # per message
 
 
+class QwenAuthError(Exception):
+    """Raised when Qwen responds with 401, 403, or invalid/expired token."""
+    pass
+
+
+class QwenChatBusyError(Exception):
+    """Raised when a specific chat session has a message currently in progress."""
+    pass
+
+
 # ----------------------------------------------------------------------------
-# Token cache (in-memory, per warm serverless instance) - replaces qwen_session.json
+# Token cache (in-memory, per warm serverless instance)
 # ----------------------------------------------------------------------------
 
 _cache_lock = threading.Lock()
-_token_cache: dict[str, Any] = {"token": None, "exp": 0.0}
+_token_cache: dict[str, Any] = {
+    "token": None,
+    "exp": 0.0,
+    "cookies": {},
+    "invalidated_tokens": set(),
+}
 
 
 def _decode_jwt_exp(token: str) -> float:
-    """Decode JWT exp claim WITHOUT verifying signature (same idea as auto.py)."""
+    """Decode JWT exp claim without verifying signature."""
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
@@ -94,11 +117,15 @@ def _decode_jwt_exp(token: str) -> float:
 
 
 def _jwt_expired(token: str) -> bool:
-    return time.time() > _decode_jwt_exp(token) - 300  # 5 min safety margin, same as auto.py
+    """Check if token is expired or will expire within 5 minutes."""
+    exp = _decode_jwt_exp(token)
+    if exp <= 0:
+        return True
+    return time.time() > exp - 300
 
 
-def extract_token(resp: requests.Response):
-    """Token ko response se kahin se bhi nikalo (same logic as auto.py)."""
+def extract_token(resp: requests.Response) -> str | None:
+    """Extract token from JSON body, cookies, or raw text."""
     try:
         body = resp.json()
     except Exception:
@@ -106,11 +133,11 @@ def extract_token(resp: requests.Response):
     data = body.get("data") or {}
     for key in ("token", "access_token", "jwt"):
         if isinstance(data, dict) and data.get(key):
-            return data[key]
-    for c in resp.cookies:  # set-cookie se
+            return str(data[key])
+    for c in resp.cookies:
         if c.name == "token":
             return c.value
-    txt = resp.text  # fallback: poora body dekho
+    txt = resp.text
     if "eyJ" in txt:
         i = txt.find("eyJ")
         j = txt.find('"', i)
@@ -119,102 +146,182 @@ def extract_token(resp: requests.Response):
     return None
 
 
-def login() -> str | None:
-    """Email+password se naya token lo. SHA256 hash bhejo (same as auto.py)."""
+def login(force: bool = False) -> str | None:
+    """Fetch fresh authentication token and session cookies.
+
+    Performs dynamic edge handshake to ensure fresh edge/WAF cookies,
+    then posts credentials to /api/v2/auths/signin.
+    """
     if not EMAIL or not PASSWORD or "yahan_apna" in PASSWORD:
+        logger.warning("Qwen credentials not configured in EMAIL/PASSWORD")
         return None
+
+    s = requests.Session()
+    # Dynamic edge handshake with correct UA
+    try:
+        s.get(f"{BASE}/", headers={"User-Agent": UA}, timeout=10)
+    except Exception as e:
+        logger.debug("Edge handshake exception: %s", e)
+
+    if ACW_TC and "acw_tc" not in s.cookies:
+        s.cookies.set("acw_tc", ACW_TC, domain="chat.qwen.ai")
+    s.cookies.set("x-ap", "ap-southeast-1", domain="chat.qwen.ai")
+
     hashed = hashlib.sha256(PASSWORD.encode()).hexdigest()
     try:
-        r = requests.post(
+        r = s.post(
             f"{BASE}/api/v2/auths/signin",
-            headers={**HEADERS, "Accept": "application/json",
-                     "Content-Type": "application/json"},
-            cookies={"acw_tc": ACW_TC, "x-ap": "ap-southeast-1"},
+            headers={**HEADERS, "Accept": "application/json", "Content-Type": "application/json"},
             json={"email": EMAIL, "password": hashed},
             timeout=20,
         )
     except requests.RequestException as e:
         logger.warning("Qwen signin request error: %s", type(e).__name__)
         return None
+
     if r.status_code != 200:
         logger.warning("Qwen signin returned HTTP %s", r.status_code)
         return None
+
     token = extract_token(r)
     if token:
-        logger.info("Qwen login OK")
-    else:
-        logger.warning("Qwen login failed: no token found in signin response")
-    return token
+        logger.info("Qwen login successful, acquired fresh token")
+        with _cache_lock:
+            _token_cache["token"] = token
+            _token_cache["exp"] = _decode_jwt_exp(token)
+            _token_cache["cookies"] = dict(s.cookies)
+            _token_cache["invalidated_tokens"].discard(token)
+        return token
+
+    logger.warning("Qwen login failed: no token found in response body or cookies")
+    return None
 
 
-def get_token() -> str | None:
-    """Valid token do: warm cache -> env-seeded token -> fresh login.
+def get_token(force_refresh: bool = False) -> tuple[str | None, dict[str, str]]:
+    """Return valid token and associated cookies.
 
-    Auto re-login on expiry (same behavior as auto.py's get_token).
-    Returns None when credentials are not configured / login fails,
-    which triggers the guest fallback in qwen_chat_impl.
+    If cached token is valid and not forced, returns cached token.
+    Otherwise triggers fresh login, updates cache, and returns fresh token.
     """
     with _cache_lock:
         tok = _token_cache["token"]
-        if tok and not _jwt_expired(tok):
-            return tok
-        if QWEN_TOKEN and not _jwt_expired(QWEN_TOKEN):
+        if (not force_refresh
+                and tok
+                and not _jwt_expired(tok)
+                and tok not in _token_cache["invalidated_tokens"]):
+            return tok, dict(_token_cache.get("cookies") or {})
+
+        # Check env-seeded token if not invalidated
+        if (not force_refresh
+                and QWEN_TOKEN
+                and not _jwt_expired(QWEN_TOKEN)
+                and QWEN_TOKEN not in _token_cache["invalidated_tokens"]):
             _token_cache["token"] = QWEN_TOKEN
             _token_cache["exp"] = _decode_jwt_exp(QWEN_TOKEN)
-            return QWEN_TOKEN
-        fresh = login()
+            return QWEN_TOKEN, dict(_token_cache.get("cookies") or {})
+
+    fresh = login(force=True)
+    with _cache_lock:
         if fresh:
-            _token_cache["token"] = fresh
-            _token_cache["exp"] = _decode_jwt_exp(fresh)
-            return fresh
+            return fresh, dict(_token_cache.get("cookies") or {})
         _token_cache["token"] = None
         _token_cache["exp"] = 0.0
-        return None
+        return None, dict(_token_cache.get("cookies") or {})
+
+
+def invalidate_token(token: str | None = None) -> None:
+    """Invalidate current or given token so next request forces fresh login."""
+    with _cache_lock:
+        curr = token or _token_cache.get("token")
+        if curr:
+            _token_cache["invalidated_tokens"].add(curr)
+        _token_cache["token"] = None
+        _token_cache["exp"] = 0.0
+        logger.info("Token invalidated; fresh login will be triggered.")
 
 
 # ----------------------------------------------------------------------------
-# Qwen HTTP client - identical endpoints/payloads to auto.py
+# Qwen HTTP client
 # ----------------------------------------------------------------------------
 
-def make_session(token: str | None = None) -> requests.Session:
+def make_session(token: str | None = None,
+                 cookies: dict[str, str] | None = None) -> requests.Session:
     s = requests.Session()
-    if ACW_TC:
+    s.headers.update(HEADERS)
+
+    if cookies:
+        for k, v in cookies.items():
+            s.cookies.set(k, v, domain="chat.qwen.ai")
+
+    if ACW_TC and "acw_tc" not in s.cookies:
         s.cookies.set("acw_tc", ACW_TC, domain="chat.qwen.ai")
-    s.cookies.set("x-ap", "ap-southeast-1", domain="chat.qwen.ai")
+    if "x-ap" not in s.cookies:
+        s.cookies.set("x-ap", "ap-southeast-1", domain="chat.qwen.ai")
+
     if token:
         s.cookies.set("token", token, domain="chat.qwen.ai")
         s.headers["Authorization"] = f"Bearer {token}"
-    s.headers.update(HEADERS)
+
     return s
 
 
-def new_chat(session: requests.Session, mode: str) -> str | None:
-    r = session.post(
-        f"{BASE}/api/v2/chats/new",
-        headers={"Accept": "application/json"},
-        json={"chat_mode": mode, "project_id": ""},
-        timeout=20,
-    )
+def get_candidate_chats(session: requests.Session, mode: str) -> list[str]:
+    """Retrieve ordered list of candidate chat IDs.
+
+    Tries /api/v2/chats/new first. If new chat creation is restricted or fails,
+    fetches existing active chats from /api/v2/chats so an idle session can be used.
+    """
+    candidates: list[str] = []
+
+    # 1. Try creating a new chat
     try:
-        body = r.json()
-    except Exception:
-        return None
-    if r.status_code == 200 and body.get("success"):
-        return body["data"]["id"]
-    return None
+        r = session.post(
+            f"{BASE}/api/v2/chats/new",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json={"chat_mode": mode, "project_id": ""},
+            timeout=15,
+        )
+        if r.status_code in (401, 403):
+            raise QwenAuthError(f"HTTP {r.status_code} on chats/new")
+        if r.status_code == 200:
+            try:
+                body = r.json()
+                if body.get("success") and "data" in body and "id" in body["data"]:
+                    candidates.append(str(body["data"]["id"]))
+            except Exception:
+                pass
+    except QwenAuthError:
+        raise
+    except Exception as e:
+        logger.debug("chats/new non-auth error: %s", e)
+
+    # 2. Fetch existing active chats as fallback / candidates
+    try:
+        r = session.get(
+            f"{BASE}/api/v2/chats",
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+        if r.status_code in (401, 403):
+            raise QwenAuthError(f"HTTP {r.status_code} on chats list")
+        if r.status_code == 200:
+            body = r.json()
+            if body.get("success") and body.get("data"):
+                for item in body["data"]:
+                    cid = str(item.get("id", ""))
+                    if cid and cid not in candidates:
+                        candidates.append(cid)
+    except QwenAuthError:
+        raise
+    except Exception as e:
+        logger.warning("Failed to fetch existing chats: %s", e)
+
+    return candidates
 
 
 def send_message(session: requests.Session, chat_id: str, mode: str,
                  messages: list[dict[str, str]]) -> tuple[bool, str]:
-    """SSE stream collect karke FINAL combined answer return karo: (ok, answer).
-
-    Chunk-parsing logic is identical to auto.py; the only difference is we
-    accumulate into a string instead of printing, because an MCP tool result
-    must contain the complete final answer.
-    """
-    # Qwen payload (auto.py jaisa). History messages plain role/content hain;
-    # wrapper fields (chat_type/feature_config/models/...) sirf last user
-    # message par - bilkul auto.py ke single-message payload ke barabar.
+    """Collect SSE streamed completion into final answer string."""
     payload_messages: list[dict[str, Any]] = []
     for i, m in enumerate(messages):
         is_last = i == len(messages) - 1
@@ -235,30 +342,41 @@ def send_message(session: requests.Session, chat_id: str, mode: str,
         "messages": payload_messages,
         "share_id": "", "version": "2.1", "origin_branch_message_id": "",
     }
+
     try:
         with session.post(
             f"{BASE}/api/v2/chat/completions",
             params={"chat_id": chat_id},
             headers={"Accept": "*/*,text/event-stream", "Cache-Control": "no-store",
-                     "Content-Type": "application/json; charset=UTF-8", "app_waf": APP_WAF},
+                     "Content-Type": "application/json; charset=UTF-8"},
             json=payload, stream=True, timeout=180,
         ) as r:
+            if r.status_code in (401, 403):
+                raise QwenAuthError(f"HTTP {r.status_code} on completions")
             if r.status_code != 200:
                 logger.warning("Qwen completions returned HTTP %s", r.status_code)
                 return False, ""
+
             answer = ""
             for line in r.iter_lines(decode_unicode=True):
                 if not line or not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
-                if not data:
+                if not data or "response.created" in data:
                     continue
                 try:
                     obj = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                if "response.created" in obj:
-                    continue
+
+                if not obj.get("success", True):
+                    err_code = str(obj.get("data", {}).get("code", ""))
+                    if err_code in ("UNAUTHORIZED", "Forbidden", "TOKEN_EXPIRED"):
+                        raise QwenAuthError(f"Qwen stream error code: {err_code}")
+                    if err_code == "CHAT_IN_PROGRESS":
+                        raise QwenChatBusyError("A message is currently being generated in this chat.")
+                    return False, ""
+
                 for choice in obj.get("choices", []):
                     delta = choice.get("delta", {})
                     if delta.get("phase") == "answer":
@@ -266,13 +384,17 @@ def send_message(session: requests.Session, chat_id: str, mode: str,
                             answer += delta["content"]
                         if delta.get("status") == "finished":
                             return bool(answer), answer
+
             return bool(answer), answer
+    except (QwenAuthError, QwenChatBusyError):
+        raise
     except requests.RequestException as e:
         logger.warning("Qwen completions request error: %s", type(e).__name__)
         return False, ""
 
 
-def _validate_messages(message, messages) -> list[dict[str, str]]:
+def _validate_messages(message: str | None,
+                       messages: list[dict[str, str]] | None) -> list[dict[str, str]]:
     """Validate input and normalize to a clean [{role, content}, ...] list."""
     if messages is not None:
         if not isinstance(messages, list) or not messages:
@@ -305,49 +427,66 @@ def _validate_messages(message, messages) -> list[dict[str, str]]:
 
 def qwen_chat_impl(message: str | None = None,
                    messages: list[dict[str, str]] | None = None) -> str:
-    """Core flow (mirrors auto.py main loop, minus the CLI):
+    """Core flow with automatic re-login on auth error:
 
-    validate -> get token (auto re-login on expiry) -> new chat
-    -> send message(s) -> collect streamed answer -> return final text.
-    Falls back to guest mode when login is unavailable/fails.
+    1. Normalizes messages.
+    2. Runs up to 2 attempts:
+       - Obtains token & cookies (forces fresh login on attempt > 0).
+       - Establishes session and retrieves candidate chats.
+       - Streams completions.
+    3. If QwenAuthError occurs on attempt 0:
+       - Automatically invalidates dead token.
+       - Triggers re-login to acquire fresh tokens.
+       - Seamlessly retries on attempt 1.
     """
     cleaned = _validate_messages(message, messages)
-
-    token = get_token()
-    mode = "token" if token else "guest"
-    logger.info("Qwen mode for this call: %s", mode)
-
     err_detail = "Qwen request failed."
-    for attempt in range(2):
-        s = make_session(token)
-        chat_id = new_chat(s, "normal" if mode == "token" else "guest")
-        if not chat_id:
-            err_detail = "Qwen chat creation failed."
-            if mode == "token" and attempt == 0:
-                fresh = login()  # token stale ho sakta hai - force re-login (auto refresh)
-                if fresh:
-                    token = fresh
-                    continue
-            break
-        ok, answer = send_message(s, chat_id, mode, cleaned)
-        if ok:
-            return answer
-        err_detail = "Qwen returned an empty or failed completion."
-        if mode == "token" and attempt == 0:
-            fresh = login()
-            if fresh:
-                token = fresh
-                continue
-        break
 
-    # Guest fallback bhi fail ho gaya / ya login hi nahi hua
+    for attempt in range(2):
+        force = attempt > 0
+        token, cookies = get_token(force_refresh=force)
+        mode = "normal" if token else "guest"
+        logger.info("Qwen mode for attempt %s: %s", attempt, mode)
+
+        s = make_session(token, cookies)
+        try:
+            candidates = get_candidate_chats(s, mode)
+            if not candidates:
+                err_detail = "Qwen chat session initialization failed (no chat sessions available)."
+                if attempt == 0:
+                    invalidate_token(token)
+                    continue
+                break
+
+            for chat_id in candidates[:5]:
+                try:
+                    ok, answer = send_message(s, chat_id, mode, cleaned)
+                    if ok:
+                        return answer
+                except QwenChatBusyError:
+                    logger.info("Chat %s busy (message in progress), trying next session...", chat_id)
+                    continue
+
+            err_detail = "Qwen returned an empty or failed completion across available sessions."
+            if attempt == 0:
+                invalidate_token(token)
+                continue
+            break
+        except QwenAuthError as e:
+            logger.warning("Qwen auth error on attempt %s: %s. Re-logging in...", attempt, e)
+            invalidate_token(token)
+            if attempt == 0:
+                continue
+            raise RuntimeError(
+                f"Qwen authentication error ({e}). Re-login was attempted but failed. "
+                "Please verify your EMAIL and PASSWORD credentials.")
+
     if mode == "guest":
         raise RuntimeError(
-            err_detail + " Running in guest mode. If account login was expected, "
-            "check the EMAIL / PASSWORD / ACW_TC / APP_WAF values at the top of api/index.py.")
+            f"{err_detail} Running in guest mode. If account login was expected, "
+            "check EMAIL / PASSWORD in api/index.py or Vercel environment variables.")
     raise RuntimeError(
-        err_detail + " Token authentication and guest fallback both failed; "
-        "check Qwen credentials and WAF cookies.")
+        f"{err_detail} Authentication retry completed. Please check your Qwen account credentials.")
 
 
 # ----------------------------------------------------------------------------
@@ -361,11 +500,10 @@ mcp = FastMCP("qwen-chat", stateless_http=True)
     name="qwen_chat",
     description=(
         "Send a user message to the configured Qwen backend (chat.qwen.ai) and "
-        "return the generated response. Provide EITHER a single 'message' string, "
+        "return the generated response. Automatically refreshes tokens and re-logins "
+        "if an authentication error occurs. Provide EITHER a single 'message' string, "
         'e.g. {"message": "Explain Python in simple words."}, OR a "messages" '
-        "conversation array of role/content objects (roles: user, assistant, "
-        "system; max 50 entries; the last message must have role 'user') to "
-        "continue an existing conversation. Returns the complete generated answer."
+        "conversation array of role/content objects."
     ),
 )
 def qwen_chat_tool(message: str | None = None,
@@ -373,21 +511,33 @@ def qwen_chat_tool(message: str | None = None,
     return qwen_chat_impl(message=message, messages=messages)
 
 
+@mcp.tool(
+    name="qwen_relogin",
+    description=(
+        "Force an immediate re-login to Qwen (chat.qwen.ai) to acquire fresh "
+        "authentication tokens and cookies. Returns token validity and expiration."
+    ),
+)
+def qwen_relogin_tool() -> str:
+    """MCP tool to force a re-login and refresh token."""
+    invalidate_token()
+    token, _ = get_token(force_refresh=True)
+    if token:
+        exp = _decode_jwt_exp(token)
+        return (f"Re-login successful! Acquired fresh token (expires at {time.ctime(exp)}). "
+                f"Token preview: {token[:16]}...")
+    return "Re-login failed. Please verify EMAIL and PASSWORD credentials."
+
+
 mcp_app = mcp.streamable_http_app()  # serves POST/GET/DELETE at /mcp
 
 
 # ----------------------------------------------------------------------------
-# Optional API-key guard + health endpoint + final ASGI app
+# Optional API-key guard + health/relogin endpoints + final ASGI app
 # ----------------------------------------------------------------------------
 
 class APIKeyAuthMiddleware:
-    """Pure-ASGI middleware: passes lifespan through, checks a static key on HTTP.
-
-    IMPORTANT: Claude Web custom connectors currently cannot send custom
-    HTTP headers (OAuth only), so if you want Claude Web to connect, leave
-    MCP_API_KEY UNSET. This guard is for direct API/inspector access and
-    non-Claude clients.
-    """
+    """Pure-ASGI middleware: passes lifespan through, checks a static key on HTTP."""
 
     def __init__(self, app):
         self.app = app
@@ -406,21 +556,55 @@ class APIKeyAuthMiddleware:
 
 
 async def healthz(request):
-    """Public health/config probe - never reveals secrets."""
+    """Public health & authentication probe."""
+    with _cache_lock:
+        curr_token = _token_cache.get("token")
+        exp = _token_cache.get("exp", 0.0)
+        is_expired = _jwt_expired(curr_token) if curr_token else True
+
     return JSONResponse({
         "ok": True,
         "service": "qwen-chat-mcp",
         "model": MODEL,
-        "auth_mode": "qwen-account + guest fallback" if (EMAIL and PASSWORD) else "guest only",
+        "auth_configured": bool(EMAIL and PASSWORD and "yahan_apna" not in PASSWORD),
+        "account_email": EMAIL if EMAIL else None,
+        "has_active_token": bool(curr_token and not is_expired),
+        "token_expires_at": time.ctime(exp) if exp else None,
+        "token_preview": (curr_token[:16] + "...") if curr_token else None,
         "mcp_endpoint": "/mcp",
+        "relogin_endpoint": "/relogin",
         "api_key_required": bool(MCP_API_KEY),
     })
 
 
+async def relogin_handler(request):
+    """Force an immediate re-login and return fresh token status."""
+    invalidate_token()
+    token, _ = get_token(force_refresh=True)
+    if token:
+        exp = _decode_jwt_exp(token)
+        return JSONResponse({
+            "ok": True,
+            "message": "Re-login successful! New token generated and cached.",
+            "account_email": EMAIL,
+            "token_preview": token[:16] + "...",
+            "expires_at": time.ctime(exp),
+            "exp_timestamp": exp,
+        })
+    return JSONResponse({
+        "ok": False,
+        "message": "Re-login failed. Please check EMAIL and PASSWORD.",
+        "account_email": EMAIL,
+    }, status_code=400)
+
+
+_lifespan = getattr(mcp_app.router, "lifespan_context", getattr(mcp_app, "lifespan", None))
+
 app = Starlette(
     routes=[
         Route("/healthz", healthz, methods=["GET"]),
+        Route("/relogin", relogin_handler, methods=["GET", "POST"]),
         Mount("/", app=APIKeyAuthMiddleware(mcp_app)),
     ],
-    lifespan=mcp_app.lifespan,  # REQUIRED for streamable-http session manager
+    lifespan=_lifespan,
 )
