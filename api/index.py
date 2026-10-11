@@ -41,6 +41,11 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
+try:
+    from mcp.server.transport_security import TransportSecuritySettings
+except ImportError:  # older mcp versions have no DNS-rebinding protection at all
+    TransportSecuritySettings = None
+
 logger = logging.getLogger("qwen-mcp")
 logging.basicConfig(level=logging.INFO)
 
@@ -493,7 +498,17 @@ def qwen_chat_impl(message: str | None = None,
 # MCP server - Streamable HTTP, STATELESS (required for Vercel serverless)
 # ----------------------------------------------------------------------------
 
-mcp = FastMCP("qwen-chat", stateless_http=True)
+# Newer mcp versions auto-enable DNS-rebinding protection for localhost hosts,
+# which rejects every request whose Host header is this deployment's own domain
+# (421 Invalid Host header). This is a public server-to-server API — access is
+# guarded by MCP_API_KEY, not by Host validation — so disable it explicitly.
+_mcp_kwargs: dict[str, Any] = {"stateless_http": True}
+if TransportSecuritySettings is not None:
+    _mcp_kwargs["transport_security"] = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
+
+mcp = FastMCP("qwen-chat", **_mcp_kwargs)
 
 
 @mcp.tool(
